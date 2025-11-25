@@ -1,4 +1,4 @@
-import streamlit as st
+
 from langchain.chat_models import init_chat_model
 from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -13,12 +13,11 @@ from langchain_community.tools import tool
 
 load_dotenv()
 
-st.title("Web RAG")
-model = init_chat_model("google_genai:gemini-2.5-flash")
-
 class WebRAG:
+    
     def __init__(self):
         self.vector_store = None
+        self.agent = None
         self.embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
         self.model = init_chat_model("google_genai:gemini-2.5-flash")
 
@@ -33,7 +32,8 @@ class WebRAG:
         docstore=InMemoryDocstore(),
         index_to_docstore_id={},
         )
-
+        
+        #loading web content
         loader = WebBaseLoader(
         web_path=web_path,
         )
@@ -48,36 +48,116 @@ class WebRAG:
             add_start_index=True,
         )
         splitted_docs = text_splitter.split_documents(docs)
-
-        print(f"Split blog post into {len(splitted_docs)} sub-documents")
-
         #storing documents
 
         document_ids = self.vector_store.add_documents(documents=splitted_docs)
-        print(document_ids[:3])
+        # Create agent after indexing
+        
+        self._create_agent()
 
-    @tool(response_format ="content_and_artifact")
-    def retrieve_content(query:str):
-        """Retrieve information to help answer a query."""
-        retrieve_docs = self.vector_store.similarity_search(query=query, k=2)
-        serialized ="\n\n".join(
-            (f"Source: {doc.metadata}\nContent: {doc.page_content}")for doc in retrieve_docs
-        )
-        return serialized, retrieve_docs
+    def _create_agent(self):
+        """Create the agent with tools. Called internally after indexing."""
+        # Create the tool with access to self
+        @tool(response_format="content_and_artifact")
+        def retrieve_content(query: str):
+            """Retrieve information to help answer a query."""
+            retrieve_docs = self.vector_store.similarity_search(query=query, k=2)
+            serialized = "\n\n".join(
+                (f"Source: {doc.metadata}\nContent: {doc.page_content}") for doc in retrieve_docs
+            )
+            return serialized, retrieve_docs
+
+        tools = [retrieve_content]
+
+        system_prompt = ("You have access to a tool that can retrieve context from a blog page. "
+                        "Use this tool whenever you need to answer a question.")
+
+        self.agent = create_agent(model=self.model, tools=tools, system_prompt=system_prompt)
+
+    def query_agent(self, query: str):
+        """Query the agent and return the response. For Streamlit integration."""
+        if self.agent is None:
+            raise ValueError("Agent not initialized. Call index_web_content first.")
+        
+        all_messages = []
+        for step in self.agent.stream({"messages": [{"role": "user", "content": query}]}, stream_mode="values"):
+            all_messages = step["messages"]
+        
+        # Find the last AI message that has text content (not just tool calls)
+        for msg in reversed(all_messages):
+            # Check if it's an AI message with actual content
+            if hasattr(msg, 'type') and msg.type == 'ai':
+                content = msg.content if hasattr(msg, 'content') else None
+                
+                # Handle different content types
+                if content:
+                    # If content is a string
+                    if isinstance(content, str) and content.strip():
+                        return content
+                    # If content is a list, extract text from it
+                    elif isinstance(content, list):
+                        text_parts = []
+                        for item in content:
+                            if isinstance(item, dict) and 'text' in item:
+                                text_parts.append(item['text'])
+                            elif isinstance(item, str):
+                                text_parts.append(item)
+                        
+                        result = ' '.join(text_parts).strip()
+                        if result:
+                            return result
+        
+        return "No response generated."
+    
+    def query_agent_stream(self, query: str):
+        """Query the agent and stream the response in real-time. Yields content as it's generated."""
+        if self.agent is None:
+            raise ValueError("Agent not initialized. Call index_web_content first.")
+        
+        # Track the last content we've seen to yield only new content
+        last_content = ""
+        
+        for step in self.agent.stream({"messages": [{"role": "user", "content": query}]}, stream_mode="values"):
+            messages = step["messages"]
+            
+            # Look for the last AI message
+            for msg in reversed(messages):
+                if hasattr(msg, 'type') and msg.type == 'ai':
+                    content = msg.content if hasattr(msg, 'content') else None
+                    
+                    if content:
+                        current_text = ""
+                        
+                        # Extract text from content
+                        if isinstance(content, str):
+                            current_text = content
+                        elif isinstance(content, list):
+                            text_parts = []
+                            for item in content:
+                                if isinstance(item, dict) and 'text' in item:
+                                    text_parts.append(item['text'])
+                                elif isinstance(item, str):
+                                    text_parts.append(item)
+                            current_text = ' '.join(text_parts)
+                        
+                        # Yield only new content
+                        if current_text and current_text != last_content:
+                            # Yield the new portion
+                            new_content = current_text[len(last_content):]
+                            if new_content:
+                                yield new_content
+                            last_content = current_text
+                    
+                    break  # Only process the last AI message
 
     def web_rag_agent(self, web_path):
-
+        """Console-based RAG agent (for backward compatibility)."""
         self.index_web_content(web_path)
+        self._create_agent()
 
-        tools =[self.retrieve_content]
+        input_query = input("Enter your query: ")
 
-        system_prompt = ("You have a access to a tools that can retrieve context from a blog page." " Use this tool whenver you need to answer a question.")
-
-        agent = create_agent(model=self.model, tools = tools, system_prompt=system_prompt)
-
-        input_query =input("Enter your query: ")
-
-        for step in agent.stream({"messages":[{"role":"user", "content":input_query}]}, stream_mode="values"):
+        for step in self.agent.stream({"messages": [{"role": "user", "content": input_query}]}, stream_mode="values"):
             step["messages"][-1].pretty_print()
 
 
